@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::{Hasher, Hash};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 
 impl Hash for Point {
     fn hash<H>(&self, state: &mut H)
@@ -14,7 +15,13 @@ impl Hash for Point {
     }
 }
 
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::select;
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
+
+use tonic::{metadata::MetadataValue, transport::server::RoutesBuilder, transport::Server, Request, Response, Status};
+use tonic_health::server::HealthReporter;
 
 use hello_world::{HelloReply, HelloRequest, greeter_server::{Greeter, GreeterServer}};
 
@@ -27,22 +34,57 @@ pub struct MyGreeter {}
 
 #[tonic::async_trait]
 impl Greeter for MyGreeter {
+    #[tracing::instrument]
     async fn say_hello(
         &self,
         request: Request<HelloRequest>, // Accept request of type HelloRequest
     ) -> Result<Response<HelloReply>, Status> { // Return an instance of type HelloReply
+        let remote_addr = request.remote_addr();
         println!("Got a request: {:?}", request);
+        let request_future = async move {
+            println!("Got a request from {:?}", request.remote_addr());
 
-        let reply = hello_world::HelloReply {
-            message: format!("Hello {}!", request.into_inner().name), // We must use .into_inner() as the fields of gRPC requests and responses are private
+            let extension = request.extensions().get::<Extension>().unwrap();
+            println!("extension data = {}", extension.some_piece_of_data);
+
+            let reply = hello_world::HelloReply {
+                message: format!("Hello {}!", request.into_inner().name), // We must use .into_inner() as the fields of gRPC requests and responses are private
+            };
+
+            Ok(Response::new(reply)) // Send back our formatted greeting
         };
-
-        Ok(Response::new(reply)) // Send back our formatted greeting
+        let cancellation_future = async move {
+            println!("Request from {:?} cancelled by client", remote_addr);
+            // If this future is executed it means the request future was dropped,
+            // so it doesn't actually matter what is returned here
+            Err(Status::cancelled("Request cancelled by client"))
+        };
+        with_cancellation_handler(request_future, cancellation_future).await
     }
 }
 
-use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+async fn with_cancellation_handler<FRequest, FCancellation>(
+    request_future: FRequest,
+    cancellation_future: FCancellation,
+) -> Result<Response<HelloReply>, Status>
+where
+    FRequest: Future<Output = Result<Response<HelloReply>, Status>> + Send + 'static,
+    FCancellation: Future<Output = Result<Response<HelloReply>, Status>> + Send + 'static,
+{
+    let token = CancellationToken::new();
+    // Will call token.cancel() when the future is dropped, such as when the client cancels the request
+    let _drop_guard = token.clone().drop_guard();
+    let select_task = tokio::spawn(async move {
+        // Can select on token cancellation on any cancellable future while handling the request,
+        // allowing for custom cleanup code or monitoring
+        select! {
+            res = request_future => res,
+            _ = token.cancelled() => cancellation_future.await,
+        }
+    });
+
+    select_task.await.unwrap()
+}
 
 use route_guide::{Feature, Point, Rectangle, RouteNote, RouteSummary, route_guide_server::{RouteGuide, RouteGuideServer}};
 
@@ -148,19 +190,60 @@ impl RouteGuide for RouteGuideService {
     }
 }
 
+/// This function (somewhat improbably) flips the status of a service every second, in order
+/// that the effect of `tonic_health::HealthReporter::watch` can be easily observed.
+async fn twiddle_service_status(mut reporter: HealthReporter) {
+    let mut iter = 0u64;
+    loop {
+        iter += 1;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        if iter % 2 == 0 {
+            reporter.set_serving::<GreeterServer<MyGreeter>>().await;
+        } else {
+            reporter.set_not_serving::<GreeterServer<MyGreeter>>().await;
+        };
+    }
+}
+
+async fn init_greeter(builder: &mut RoutesBuilder) {
+    println!("Adding Greeter service...");
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<GreeterServer<MyGreeter>>()
+        .await;
+    tokio::spawn(twiddle_service_status(health_reporter.clone()));
+    let greeter = MyGreeter::default();
+    builder.add_service(health_service);
+    builder.add_service(GreeterServer::with_interceptor(greeter, intercept));
+}
+
+fn init_route_guide(builder: &mut RoutesBuilder) {
+    println!("Adding Route Guide service...");
+    let route_guide = RouteGuideService {
+        features: Arc::new(data::load()),
+    };
+    let route_guide_server = RouteGuideServer::with_interceptor(route_guide, check_auth);
+    builder.add_service(route_guide_server);
+}
+
 mod data;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+
     let addr = "[::1]:50051".parse().unwrap();
-    let greeter = MyGreeter::default();
-    let route_guide = RouteGuideService {
-        features: Arc::new(data::load()),
-    };
-    let svc = RouteGuideServer::new(route_guide);
+    let mut routes_builder = RoutesBuilder::default();
+    init_greeter(&mut routes_builder).await;
+    init_route_guide(&mut routes_builder);
+    
     Server::builder()
-        .add_service(GreeterServer::new(greeter))
-        .add_service(svc)
+        .trace_fn(|_| tracing::info_span!("helloworld_server"))
+        .accept_http1(true)
+        .add_routes(routes_builder.routes())
         .serve(addr)
         .await?;
 
@@ -208,4 +291,31 @@ fn calc_distance(p1: &Point, p2: &Point) -> i32 {
     let c = 2f64 * a.sqrt().atan2((1f64 - a).sqrt());
 
     (R * c) as i32
+}
+
+/// This function will get called on each inbound request, if a `Status`
+/// is returned, it will cancel the request and return that status to the
+/// client.
+fn intercept(mut req: Request<()>) -> Result<Request<()>, Status> {
+    println!("Intercepting request: {:?}", req);
+
+    // Set an extension that can be retrieved by `say_hello`
+    req.extensions_mut().insert(Extension {
+        some_piece_of_data: "foo".to_string(),
+    });
+
+    Ok(req)
+}
+
+struct Extension {
+    some_piece_of_data: String,
+}
+
+fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
+    let token: MetadataValue<_> = "Bearer some-auth-token".parse().unwrap();
+    println!("Check auth: {:?}", req.metadata().get("authorization"));
+    match req.metadata().get("authorization") {
+        Some(t) if token == t => Ok(req),
+        _ => Err(Status::unauthenticated("No valid auth token")),
+    }
 }

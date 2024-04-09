@@ -41,3 +41,10 @@ curl -sSL "https://github.com/fullstorydev/grpcurl/releases/download/v1.8.7/grpc
 grpcurl -plaintext -import-path ./protos/helloworld -proto helloworld.proto -d '{"name": "Tonic"}' '[::1]:50051' helloworld.Greeter/S
 ayHello
 ```
+
+### grpc-health-probe
+
+```
+# install
+go install github.com/grpc-ecosystem/grpc-health-probe@latest
+```

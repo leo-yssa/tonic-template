@@ -1,13 +1,18 @@
 use std::error::Error;
-use std::time::Duration;
 
 use rand::rngs::ThreadRng;
 use rand::Rng;
 
-use tokio::time;
+use tokio::time::{Duration, Instant, interval, timeout};
 
-use tonic::transport::Channel;
-use tonic::Request;
+use tonic::{
+    codegen::InterceptedService,
+    metadata::MetadataValue,
+    service::Interceptor,
+    transport::{Channel, Endpoint},
+    Request, Status,
+};
+use tonic_web::GrpcWebClientLayer;
 
 use hello_world::{HelloRequest, greeter_client::GreeterClient};
 
@@ -21,7 +26,7 @@ pub mod route_guide {
     tonic::include_proto!("routeguide");
 }
 
-async fn print_features(client: &mut RouteGuideClient<Channel>) -> Result<(), Box<dyn Error>> {
+async fn print_features(client: &mut RouteGuideClient<InterceptedService<Channel, impl Fn(Request<()>) -> Result<Request<()>, Status>>>) -> Result<(), Box<dyn Error>> {
     let rectangle = Rectangle {
         lo: Some(Point {
             latitude: 400_000_000,
@@ -45,7 +50,7 @@ async fn print_features(client: &mut RouteGuideClient<Channel>) -> Result<(), Bo
     Ok(())
 }
 
-async fn run_record_route(client: &mut RouteGuideClient<Channel>) -> Result<(), Box<dyn Error>> {
+async fn run_record_route(client: &mut RouteGuideClient<InterceptedService<Channel, impl Fn(Request<()>) -> Result<Request<()>, Status>>>) -> Result<(), Box<dyn Error>> {
     let mut rng = rand::thread_rng();
     let point_count: i32 = rng.gen_range(2..100);
 
@@ -65,11 +70,11 @@ async fn run_record_route(client: &mut RouteGuideClient<Channel>) -> Result<(), 
     Ok(())
 }
 
-async fn run_route_chat(client: &mut RouteGuideClient<Channel>) -> Result<(), Box<dyn Error>> {
-    let start = time::Instant::now();
+async fn run_route_chat(client: &mut RouteGuideClient<InterceptedService<Channel, impl Fn(Request<()>) -> Result<Request<()>, Status>>>) -> Result<(), Box<dyn Error>> {
+    let start = Instant::now();
 
     let outbound = async_stream::stream! {
-        let mut interval = time::interval(Duration::from_secs(1));
+        let mut interval = interval(Duration::from_secs(1));
 
         loop {
             let time = interval.tick().await;
@@ -98,17 +103,53 @@ async fn run_route_chat(client: &mut RouteGuideClient<Channel>) -> Result<(), Bo
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut hello_world_client = GreeterClient::connect("http://[::1]:50051").await?;
+    tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+    let channel = Endpoint::from_static("http://[::1]:50051")
+        .connect()
+        .await?;
+    let mut hello_world_client = GreeterClient::with_interceptor(channel.clone(), intercept);
 
     let hello_request = Request::new(HelloRequest {
         name: "Tonic".into(),
     });
+    tracing::info!(
+        message = "Sending request.",
+        request = %hello_request.get_ref().name
+    );
+    let hello_response = match timeout(Duration::from_secs(1), hello_world_client.say_hello(hello_request)).await {
+        Ok(response) => response?,
+        Err(_) => {
+            println!("Cancelled request after 1s");
+            return Ok(());
+        }
+    };
 
-    let hello_response = hello_world_client.say_hello(hello_request).await?;
+    tracing::info!(
+        message = "Got a response.",
+        response = %hello_response.get_ref().message
+    );
 
-    println!("RESPONSE={:?}", hello_response);
+    let hyper_client = hyper::Client::builder().build_http();
+    let svc = tower::ServiceBuilder::new()
+        .layer(GrpcWebClientLayer::new())
+        .service(hyper_client);
+    let mut greeter_client_with_hyper = GreeterClient::with_origin(svc, "http://[::1]:50051".try_into()?);
 
-    let mut route_guide_client = RouteGuideClient::connect("http://[::1]:50051").await?;
+    let request = tonic::Request::new(HelloRequest {
+        name: "Tonic".into(),
+    });
+
+    let response = greeter_client_with_hyper.say_hello(request).await?;
+
+    println!("RESPONSE={:?}", response);
+
+    let token: MetadataValue<_> = "Bearer some-auth-token".parse()?;
+    let mut route_guide_client = RouteGuideClient::with_interceptor(channel.clone(), move |mut req: Request<()>| {
+        req.metadata_mut().insert("authorization", token.clone());
+        Ok(req)
+    });
 
     let point_request = Request::new(Point {
         latitude: 409146138,
@@ -128,6 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n*** BIDIRECTIONAL STREAMING ***");
     run_route_chat(&mut route_guide_client).await?;
 
+    
+
     Ok(())
 }
 
@@ -138,4 +181,49 @@ fn random_point(rng: &mut ThreadRng) -> Point {
         latitude,
         longitude,
     }
+}
+
+/// This function will get called on each outbound request. Returning a
+/// `Status` here will cancel the request and have that status returned to
+/// the caller.
+fn intercept(req: Request<()>) -> Result<Request<()>, Status> {
+    println!("Intercepting request: {:?}", req);
+    Ok(req)
+}
+
+// You can also use the `Interceptor` trait to create an interceptor type
+// that is easy to name
+struct MyInterceptor;
+
+impl Interceptor for MyInterceptor {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        Ok(request)
+    }
+}
+
+#[allow(dead_code, unused_variables)]
+async fn using_named_interceptor() -> Result<(), Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_static("http://[::1]:50051")
+        .connect()
+        .await?;
+
+    let client: GreeterClient<InterceptedService<Channel, MyInterceptor>> =
+        GreeterClient::with_interceptor(channel, MyInterceptor);
+
+    Ok(())
+}
+
+// Using a function pointer type might also be possible if your interceptor is a
+// bare function that doesn't capture any variables
+#[allow(dead_code, unused_variables, clippy::type_complexity)]
+async fn using_function_pointer_interceptro() -> Result<(), Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_static("http://[::1]:50051")
+        .connect()
+        .await?;
+
+    let client: GreeterClient<
+        InterceptedService<Channel, fn(tonic::Request<()>) -> Result<tonic::Request<()>, Status>>,
+    > = GreeterClient::with_interceptor(channel, intercept);
+
+    Ok(())
 }
