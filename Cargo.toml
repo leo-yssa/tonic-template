@@ -15,7 +15,9 @@ path = "src/client.rs"
 
 [dependencies]
 async-stream = "0.2"
+http = "0.2"
 hyper = "0.14"
+listenfd = "1.0"
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -23,8 +25,8 @@ prost = "0.12"
 tonic = "0.11"
 tonic-health = "0.11"
 tonic-web = "0.11"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-stream = "0.1"
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
 tower = "0.4"
 tracing = "0.1.16"

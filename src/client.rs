@@ -14,6 +14,9 @@ use tonic::{
 };
 use tonic_web::GrpcWebClientLayer;
 
+use service::AuthSvc;
+use tower::ServiceBuilder;
+
 use hello_world::{HelloRequest, greeter_client::GreeterClient};
 
 pub mod hello_world {
@@ -109,7 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channel = Endpoint::from_static("http://[::1]:50051")
         .connect()
         .await?;
-    let mut hello_world_client = GreeterClient::with_interceptor(channel.clone(), intercept);
+    let auth_service = ServiceBuilder::new()
+        // Interceptors can be also be applied as middleware
+        .layer(tonic::service::interceptor(intercept))
+        .layer_fn(AuthSvc::new)
+        .service(channel.clone());
+    
+    let mut hello_world_client = GreeterClient::new(auth_service);
 
     let hello_request = Request::new(HelloRequest {
         name: "Tonic".into(),
@@ -169,8 +178,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n*** BIDIRECTIONAL STREAMING ***");
     run_route_chat(&mut route_guide_client).await?;
 
-    
-
     Ok(())
 }
 
@@ -226,4 +233,51 @@ async fn using_function_pointer_interceptro() -> Result<(), Box<dyn std::error::
     > = GreeterClient::with_interceptor(channel, intercept);
 
     Ok(())
+}
+
+mod service {
+    use http::{Request, Response};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tonic::body::BoxBody;
+    use tonic::transport::Body;
+    use tonic::transport::Channel;
+    use tower::Service;
+
+    pub struct AuthSvc {
+        inner: Channel,
+    }
+
+    impl AuthSvc {
+        pub fn new(inner: Channel) -> Self {
+            AuthSvc { inner }
+        }
+    }
+
+    impl Service<Request<BoxBody>> for AuthSvc {
+        type Response = Response<Body>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        #[allow(clippy::type_complexity)]
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx).map_err(Into::into)
+        }
+
+        fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+            // This is necessary because tonic internally uses `tower::buffer::Buffer`.
+            // See https://github.com/tower-rs/tower/issues/547#issuecomment-767629149
+            // for details on why this is necessary
+            let clone = self.inner.clone();
+            let mut inner = std::mem::replace(&mut self.inner, clone);
+
+            Box::pin(async move {
+                // Do extra async work here...
+                let response = inner.call(req).await?;
+
+                Ok(response)
+            })
+        }
+    }
 }
